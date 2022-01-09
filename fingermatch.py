@@ -78,6 +78,7 @@ import io
 import re
 import pickle
 from collections import namedtuple
+from os.path import exists
 
 import idaapi as ida
 
@@ -1104,48 +1105,95 @@ def collect(fingerdb_path, annotations_path):
         print('saving annotations to  {}'.format(annotations_path))
         save_annotations(nodes, annotations_path)
 
+    # resolve references
+    node_intervals = IntervalTree([(node['ea'], node['ea'] + node['size'], node) for node in nodes])
+    print('  resolving references  ')
+    unknowns = {}
+    reference_count = 0
+    for n, node in progress(enumerate(nodes)):
+        node['refs'] = resolve_refs(node['refs'], node_intervals, unknowns)
+        reference_count += len(node['refs'])
+    print('postprocessing')
+    print('  reference count  {}'.format(reference_count))
+    print('  reference unknowns  {}'.format(len(unknowns)))
+
+    # verify node strongness (must have unique fingerprint)
+    verify_strongness(nodes)
+
+    # name matching
+    names = {}
+    for node in nodes:
+        names[node['name']] = node
+
+    # remove things not used for matching
+    for node in nodes:
+        del node['ea']
+
+    # collect types used for fingerprinted functions and data
+    types = collect_types()
+
     # save fingerdb
     if fingerdb_path is not None:
-        # resolve references
-        node_intervals = IntervalTree([(node['ea'], node['ea'] + node['size'], node) for node in nodes])
-        print('  resolving references  ')
-        unknowns = {}
-        reference_count = 0
-        for n, node in progress(enumerate(nodes)):
-            node['refs'] = resolve_refs(node['refs'], node_intervals, unknowns)
-            reference_count += len(node['refs'])
-        print('postprocessing')
-        print('  reference count  {}'.format(reference_count))
-        print('  reference unknowns  {}'.format(len(unknowns)))
+        if not exists(fingerdb_path):
+            # if the database file does not exist, create a new one
 
-        # verify node strongness (must have unique fingerprint)
-        verify_strongness(nodes)
+            # signature matching
+            # not necessary to save the patterns and patterns_unknow 
+            # since they can be deduced from nodes.
+            #patterns, patterns_unknown = build_signature_matcher(nodes)
 
-        # signature matching
-        patterns, patterns_unknown = build_signature_matcher(nodes)
+            # pickle fingerprints
+            print('saving fingerprints to  {}'.format(fingerdb_path))
+            save_fdb(fingerdb_path, {
+                'version': 0,
+                'nodes': nodes,
+                'names': names,
+                'types': types,
+            })
+        else:
+            # if the specified database file exist, merge them
+            print(f"database {fingerdb_path} already exists, going to merge them")
 
-        # name matching
-        names = {}
-        for node in nodes:
-            names[node['name']] = node
+            db = load_fdb(fingerdb_path)
+            version = db.get('version', -1)
+            if not isinstance(version, (int, float)) or version < 0:
+                raise OperationFailed('you have loaded old version of database, please recreate the database')
+            old_nodes = db['nodes']
+            old_types = db['types']
+            
+            refs = {'function':[],'data':[],'type':[]}
+            new_count = {'function':0, 'data':0, 'type':0}
+            
+            for old_node in old_nodes:
+                refs[old_node['type']].append(old_node['name'])
+            for old_type in old_types:
+                refs['type'].append(old_type)
 
-        # remove things not used for matching
-        for node in nodes:
-            del node['ea']
-
-        # collect types used for fingerprinted functions and data
-        types = collect_types()
-
-        # pickle fingerprints
-        print('saving fingerprints to  {}'.format(fingerdb_path))
-        save_fdb(fingerdb_path, {
-            'version': 0,
-            'nodes': nodes,
-            'patterns': patterns,
-            'patterns_unknown': patterns_unknown,
-            'names': names,
-            'types': types,
-        })
+            
+            for node in nodes:
+                if node['name'] not in refs[node['type']]:
+                    old_nodes.append(node)
+                    new_count[node['type']] += 1
+            
+            for type in types:
+                if type['name'] not in refs['type']:
+                    old_types.append(type)
+                    new_count['type'] += 1
+            
+            names = {}
+            for node in old_nodes:
+                names[node['name']] = node
+            
+            print(f"collected {new_count['function']} functions, {new_count['data']} data, {new_count['type']} types")
+            
+            save_fdb(fingerdb_path, {
+                'version': 0,
+                'nodes': old_nodes,
+                #'patterns': patterns,
+                #'patterns_unknown': patterns_unknown,
+                'names': names,
+                'types': old_types,
+            })
 
     print('done\n')
 
@@ -1837,8 +1885,10 @@ def match(fingerdb_path, annotations_path, apply_matches):
     if not isinstance(version, (int, float)) or version < 0:
         raise OperationFailed('you have loaded old version of database, please recreate the database')
     nodes = db['nodes']
-    patterns = db['patterns']
-    patterns_unknown = db['patterns_unknown']
+    # rebuild the patterns and patterns_unknown from nodes
+    patterns, patterns_unknown = build_signature_matcher(nodes)
+    #patterns = db['patterns']
+    #patterns_unknown = db['patterns_unknown']
     names = db['names']
     types = db['types']
 
