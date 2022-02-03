@@ -68,6 +68,7 @@ Todo
  * rewrite fdb merging
 """
 
+from copy import deepcopy
 import sys
 import json
 import bisect
@@ -807,7 +808,8 @@ def fingerprint_functions(segments):
         fn_start = function.start_ea
         fn_end = function.end_ea
         fn_flags = ida.get_flags(fn_start)
-        fn_name = ida.get_name(fn_start)
+        #fn_name = ida.get_name(fn_start)
+        fn_name = ida.get_name(fn_start).replace("w2c_","")
         if ida.get_tinfo(tinfo, fn_start):
             fn_type = tinfo._print(None, ida.PRTYPE_1LINE | ida.PRTYPE_SEMI)
         else:
@@ -1074,7 +1076,7 @@ def verify_strongness(nodes):
             fingerprints[fprint] = node
 
 
-def collect(fingerdb_path, annotations_path):
+def collect(fingerdb_path, exclude_regex, annotations_path):
     """
     Create fingerprints for whole db
     """
@@ -1086,6 +1088,19 @@ def collect(fingerdb_path, annotations_path):
     nodes = []
     nodes.extend(fingerprint_functions(segments))
     nodes.extend(fingerprint_data_places(segments))
+
+    # remove the symbols matching the exclude_regex
+    pattern = re.compile(exclude_regex)
+
+    nodes_dup = deepcopy(nodes)
+
+    for node in nodes:
+        if pattern.match(node['name']):
+            print(f"removed {node['type']}: {node['name']}")
+            nodes_dup.remove(node)
+
+    nodes = nodes_dup
+
 
     function_count = 0
     data_count = 0
@@ -1120,6 +1135,11 @@ def collect(fingerdb_path, annotations_path):
     # verify node strongness (must have unique fingerprint)
     verify_strongness(nodes)
 
+    # signature matching
+    # not necessary to save the patterns and patterns_unknow 
+    # since they can be deduced from nodes.
+    #patterns, patterns_unknown = build_signature_matcher(nodes)
+
     # name matching
     names = {}
     for node in nodes:
@@ -1132,28 +1152,31 @@ def collect(fingerdb_path, annotations_path):
     # collect types used for fingerprinted functions and data
     types = collect_types()
 
+    #open("e:/misc/CWE121/nodes.txt","w").write("nodes = " + str(nodes))
+
     # save fingerdb
     if fingerdb_path is not None:
+        # if the database file does not exist, create a new one
         if not exists(fingerdb_path):
-            # if the database file does not exist, create a new one
-
-            # signature matching
-            # not necessary to save the patterns and patterns_unknow 
-            # since they can be deduced from nodes.
-            #patterns, patterns_unknown = build_signature_matcher(nodes)
+            
 
             # pickle fingerprints
             print('saving fingerprints to  {}'.format(fingerdb_path))
+
+            #open("e:/misc/nodes.txt","w").write("nodes = " + str(nodes))
+            
             save_fdb(fingerdb_path, {
                 'version': 0,
                 'nodes': nodes,
+                #'patterns': patterns,
+                #'patterns_unknown': patterns_unknown,
                 'names': names,
                 'types': types,
             })
+        # if the database file exist, merge them
         else:
-            # if the specified database file exist, merge them
+            #pass
             print(f"database {fingerdb_path} already exists, going to merge them")
-
             db = load_fdb(fingerdb_path)
             version = db.get('version', -1)
             if not isinstance(version, (int, float)) or version < 0:
@@ -1162,7 +1185,10 @@ def collect(fingerdb_path, annotations_path):
             old_types = db['types']
             
             refs = {'function':[],'data':[],'type':[]}
-            new_count = {'function':0, 'data':0, 'type':0}
+
+            new_function_count = 0
+            new_data_count = 0
+            new_type_count = 0
             
             for old_node in old_nodes:
                 refs[old_node['type']].append(old_node['name'])
@@ -1173,19 +1199,22 @@ def collect(fingerdb_path, annotations_path):
             for node in nodes:
                 if node['name'] not in refs[node['type']]:
                     old_nodes.append(node)
-                    new_count[node['type']] += 1
+                    new_function_count += (node['type'] == "functions")
+                    new_data_count += (node['type'] == "data")
             
             for type in types:
                 if type['name'] not in refs['type']:
                     old_types.append(type)
-                    new_count['type'] += 1
+                    new_type_count += 1
             
             names = {}
             for node in old_nodes:
                 names[node['name']] = node
             
-            print(f"collected {new_count['function']} functions, {new_count['data']} data, {new_count['type']} types")
+            print(f"collected {new_function_count} functions, {new_data_count} data, {new_type_count} types")
             
+            #open("e:/misc/nodes.txt","w").write("nodes = " + str(old_nodes))
+
             save_fdb(fingerdb_path, {
                 'version': 0,
                 'nodes': old_nodes,
@@ -1885,7 +1914,6 @@ def match(fingerdb_path, annotations_path, apply_matches):
     if not isinstance(version, (int, float)) or version < 0:
         raise OperationFailed('you have loaded old version of database, please recreate the database')
     nodes = db['nodes']
-    # rebuild the patterns and patterns_unknown from nodes
     patterns, patterns_unknown = build_signature_matcher(nodes)
     #patterns = db['patterns']
     #patterns_unknown = db['patterns_unknown']
@@ -1954,7 +1982,7 @@ def fingermatch_merge(filenames, output_name, exclusions=None):
     raise NotImplementedError('Merging databases is not implemented yet')
 
 
-def fingermatch_collect(fingerdb_path, annotations_path=None):
+def fingermatch_collect(fingerdb_path, exclude_regex=None, annotations_path=None):
     """
     Collect functions, data, types and comments and save them into database
 
@@ -1966,10 +1994,13 @@ def fingermatch_collect(fingerdb_path, annotations_path=None):
 
     if fingerdb_path is None and annotations_path is None:
         raise ValueError('At least one of fingerdb_path and annotations_path must be provided')
-
+        
     ida.show_wait_box('collecting fingerprints')
+
+    if exclude_regex and not isinstance(exclude_regex, str):
+        raise ValueError('exclude_regex should be a string of regex')
     try:
-        return collect(fingerdb_path, annotations_path)
+        return collect(fingerdb_path, exclude_regex, annotations_path)
     except UserInterrupt:
         print('\nuser interrupted collecting fingerprints\n')
     except OperationFailed as exception:
